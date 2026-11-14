@@ -1,0 +1,272 @@
+name: Build PSOBB Shortcut Manager
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Shortcut Manager patch
+        uses: actions/checkout@v4
+
+      - name: Checkout current Soly plugin
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/Solybum/psobbaddonplugin.git upstream
+
+      - name: Apply Shortcut Manager patch
+        shell: pwsh
+        run: |
+          python patch/apply_patch.py upstream
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # ------------------------------------------------------------
+      # Dependencies expected by the Soly bbmod project
+      # ------------------------------------------------------------
+
+      - name: Build MinHook x86
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/TsudaKageyu/minhook.git minhook
+
+          msbuild minhook/build/VC17/libMinHook.vcxproj `
+            /m `
+            /p:Configuration=Release `
+            /p:Platform=Win32
+
+          $lib = Get-ChildItem minhook -Recurse -Filter "libMinHook*.lib" |
+            Where-Object { $_.Name -match "x86" } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+
+          if (-not $lib) {
+            throw "No x86 MinHook library found after MinHook build."
+          }
+
+          Write-Host "Using MinHook: $($lib.FullName)"
+
+          New-Item -ItemType Directory -Force -Path "upstream/bbmod/libs" | Out-Null
+
+          Copy-Item `
+            $lib.FullName `
+            "upstream/bbmod/libs/libMinHook-x86-v140-mtd.lib" `
+            -Force
+
+      - name: Build LuaJIT 5.1 x86
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/LuaJIT/LuaJIT.git luajit
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe not found."
+          }
+
+          $vs = & $vswhere `
+            -latest `
+            -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+          if (-not $vs) {
+            throw "Visual Studio C++ toolchain not found."
+          }
+
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars32.bat"
+
+          if (-not (Test-Path $vcvars)) {
+            throw "vcvars32.bat not found: $vcvars"
+          }
+
+          $luaSrc = (Resolve-Path "luajit/src").Path
+
+          Write-Host "Visual Studio: $vs"
+          Write-Host "LuaJIT source: $luaSrc"
+
+          cmd /c "`"$vcvars`" && cd /d `"$luaSrc`" && msvcbuild.bat"
+
+          $luaLib = Get-ChildItem "luajit/src" -Filter "lua51.lib" |
+            Select-Object -First 1
+
+          $luaDll = Get-ChildItem "luajit/src" -Filter "lua51.dll" |
+            Select-Object -First 1
+
+          if (-not $luaLib) {
+            throw "lua51.lib not found after LuaJIT build."
+          }
+
+          if (-not $luaDll) {
+            throw "lua51.dll not found after LuaJIT build."
+          }
+
+          Write-Host "Using LuaJIT import library: $($luaLib.FullName)"
+          Write-Host "Using LuaJIT runtime DLL: $($luaDll.FullName)"
+
+          New-Item -ItemType Directory -Force -Path "upstream/bbmod/libs" | Out-Null
+
+          Copy-Item `
+            $luaLib.FullName `
+            "upstream/bbmod/libs/lua51.lib" `
+            -Force
+
+          New-Item -ItemType Directory -Force -Path "runtime" | Out-Null
+
+          Copy-Item `
+            $luaDll.FullName `
+            "runtime/lua51.dll" `
+            -Force
+
+      # ------------------------------------------------------------
+      # Sanity check BEFORE attempting the Soly build
+      # ------------------------------------------------------------
+
+      - name: Verify native dependencies
+        shell: pwsh
+        run: |
+          $required = @(
+            "upstream/bbmod/libs/libMinHook-x86-v140-mtd.lib",
+            "upstream/bbmod/libs/lua51.lib",
+            "runtime/lua51.dll"
+          )
+
+          foreach ($file in $required) {
+            if (-not (Test-Path $file)) {
+              throw "Missing required dependency: $file"
+            }
+
+            $item = Get-Item $file
+            Write-Host ("OK  {0}  ({1} bytes)" -f $file, $item.Length)
+          }
+
+      # ------------------------------------------------------------
+      # Read the project's REAL configuration instead of trusting
+      # the inconsistent .sln platform list.
+      # ------------------------------------------------------------
+
+      - name: Detect bbmod Release configuration
+        id: config
+        shell: pwsh
+        run: |
+          $proj = "upstream/bbmod/bbmod.vcxproj"
+          [xml]$xml = Get-Content $proj
+
+          $configs = @()
+
+          foreach ($group in $xml.Project.ItemGroup) {
+            foreach ($pc in $group.ProjectConfiguration) {
+              if ($pc.Include) {
+                $configs += [string]$pc.Include
+              }
+            }
+          }
+
+          $configs = $configs | Select-Object -Unique
+
+          Write-Host "Configurations declared in bbmod.vcxproj:"
+          $configs | ForEach-Object { Write-Host "  $_" }
+
+          $selected = $configs |
+            Where-Object { $_ -match '^Release\|' } |
+            Select-Object -First 1
+
+          if (-not $selected) {
+            throw "No Release|... configuration found in bbmod.vcxproj."
+          }
+
+          $parts = $selected.Split('|', 2)
+          $configuration = $parts[0]
+          $platform = $parts[1]
+
+          Write-Host "Selected: $selected"
+
+          "configuration=$configuration" >> $env:GITHUB_OUTPUT
+          "platform=$platform" >> $env:GITHUB_OUTPUT
+
+      # ------------------------------------------------------------
+      # Build patched Soly plugin
+      # ------------------------------------------------------------
+
+      - name: Build patched bbmod
+        shell: pwsh
+        run: |
+          $configuration = "${{ steps.config.outputs.configuration }}"
+          $platform = "${{ steps.config.outputs.platform }}"
+
+          msbuild upstream/bbmod/bbmod.vcxproj `
+            /m `
+            /p:Configuration="$configuration" `
+            /p:Platform="$platform"
+
+      - name: Locate built dinput8.dll
+        id: locate
+        shell: pwsh
+        run: |
+          $dlls = Get-ChildItem upstream -Recurse -Filter "dinput8.dll" |
+            Where-Object {
+              $_.FullName -notmatch '\\Debug\\' -and
+              $_.FullName -notmatch '\\deps\\'
+            }
+
+          Write-Host "dinput8.dll candidates:"
+          $dlls | ForEach-Object { Write-Host "  $($_.FullName)" }
+
+          $dll = $dlls |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+
+          if (-not $dll) {
+            throw "dinput8.dll not found after build."
+          }
+
+          Write-Host "Selected DLL: $($dll.FullName)"
+          "dll=$($dll.FullName)" >> $env:GITHUB_OUTPUT
+
+      # ------------------------------------------------------------
+      # Package everything needed by Ephinea
+      # ------------------------------------------------------------
+
+      - name: Package Ephinea files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          New-Item -ItemType Directory -Force -Path "dist/addons" | Out-Null
+
+          $dll = "${{ steps.locate.outputs.dll }}"
+
+          Copy-Item $dll "dist/dinput8.dll" -Force
+          Copy-Item "runtime/lua51.dll" "dist/lua51.dll" -Force
+
+          $pdb = [System.IO.Path]::ChangeExtension($dll, ".pdb")
+          if (Test-Path $pdb) {
+            Copy-Item $pdb "dist/dinput8.pdb" -Force
+          }
+
+          Copy-Item `
+            -Recurse `
+            "addon/Shortcut Manager" `
+            "dist/addons/Shortcut Manager"
+
+          # Official Virtual Keyboard v0.2.2 runtime supplied by the user.
+          # Its d3d9.dll proxy is separate from Soly's dinput8.dll.
+          Copy-Item "virtual-keyboard-0.2.2-runtime/d3d9.dll" "dist/d3d9.dll" -Force
+          Copy-Item "virtual-keyboard-0.2.2-runtime/shared_utils.dll" "dist/shared_utils.dll" -Force
+          Copy-Item "virtual-keyboard-0.2.2-runtime/mod" "dist/mod" -Recurse -Force
+
+          Write-Host ""
+          Write-Host "Final package:"
+          Get-ChildItem dist -Recurse | ForEach-Object {
+            Write-Host "  $($_.FullName)"
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PSOBB-Shortcut-Manager-Virtual-Keyboard-BUNDLE-v0.4.3
+          path: dist
+          if-no-files-found: error
