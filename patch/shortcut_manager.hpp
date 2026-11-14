@@ -39,6 +39,12 @@ static std::atomic<int> gStatus(0);
 static std::atomic<int> gCaptureEnabled(1);
 // Set by the virtual keyboard bridge while its overlay owns controller input.
 static std::atomic<int> gVirtualKeyboardActive(0);
+// Independent DirectInput virtual keyboard. Pressed scan codes are merged into
+// the game's DirectInput keyboard state, never into XInput.
+static DWORD gVKScanExpiry[256] = {};
+static DWORD gVKShiftExpiry = 0;
+static std::atomic<unsigned long> gVKToggleMask((1UL << 6) | (1UL << 7));
+
 
 static std::string module_dir() {
     HMODULE hm = nullptr;
@@ -78,17 +84,36 @@ static void send_scan(WORD scan, bool keyUp) {
     SendInput(1, &in, sizeof(INPUT));
 }
 
+// Emit each chord as one ordered SendInput batch. The modifier key-down
+// precedes the function-key down; releases are sent in reverse order.
+// This is still SendInput injection (not DirectInput keyboard-state patching),
+// and must be verified against the actual PSOBB client input path.
+static bool send_rule_chord(const Rule& r, bool keyUp) {
+    INPUT inputs[4] = {};
+    UINT count = 0;
+    auto append = [&](WORD scan) {
+        inputs[count++] = make_scan_input(scan, keyUp);
+    };
+
+    if (!keyUp) {
+        if (r.ctrl) append(DIK_LCONTROL);
+        if (r.shift) append(DIK_LSHIFT);
+        if (r.alt) append(DIK_LMENU);
+        append(r.key);
+    } else {
+        append(r.key);
+        if (r.alt) append(DIK_LMENU);
+        if (r.shift) append(DIK_LSHIFT);
+        if (r.ctrl) append(DIK_LCONTROL);
+    }
+    return SendInput(count, inputs, sizeof(INPUT)) == count;
+}
+
 static void press_rule(Rule& r) {
     if (r.syntheticDown || r.key == 0) return;
-
-    if (r.ctrl)  send_scan(DIK_LCONTROL, false);
-    if (r.shift) send_scan(DIK_LSHIFT, false);
-    if (r.alt)   send_scan(DIK_LMENU, false);
-
-    send_scan(r.key, false);
-
+    if (!send_rule_chord(r, false)) return;
     r.syntheticDown = true;
-    r.releaseAt = GetTickCount() + 70;
+    r.releaseAt = GetTickCount() + 100;
 }
 
 static void release_rule(Rule& r) {
@@ -96,14 +121,7 @@ static void release_rule(Rule& r) {
         r.releaseAt = 0;
         return;
     }
-
-    // Release main key first, then modifiers.
-    send_scan(r.key, true);
-
-    if (r.alt)   send_scan(DIK_LMENU, true);
-    if (r.shift) send_scan(DIK_LSHIFT, true);
-    if (r.ctrl)  send_scan(DIK_LCONTROL, true);
-
+    send_rule_chord(r, true);
     r.syntheticDown = false;
     r.releaseAt = 0;
 }
@@ -220,6 +238,25 @@ static unsigned long pov_to_dpad_mask(DWORD pov) {
     return mask;
 }
 
+// Pulse a DirectInput scan code for 110 ms; the game's next keyboard poll
+// receives the key. Out-of-range values cannot write outside the state array.
+extern "C" __declspec(dllexport) void __cdecl SM_VKPressKey(int scan, int shift) {
+    if (scan <= 0 || scan >= 256 || !gVirtualKeyboardActive.load()) return;
+    std::lock_guard<std::mutex> lock(gMutex);
+    const DWORD expiry = GetTickCount() + 110;
+    gVKScanExpiry[scan] = expiry;
+    if (shift) gVKShiftExpiry = expiry;
+}
+
+extern "C" __declspec(dllexport) void __cdecl SM_SetVKToggleMask(unsigned long mask) {
+    // Two distinct controller buttons are strongly recommended for toggle.
+    gVKToggleMask.store(mask);
+}
+
+extern "C" __declspec(dllexport) unsigned long __cdecl SM_GetVKToggleMask() {
+    return gVKToggleMask.load();
+}
+
 extern "C" __declspec(dllexport) unsigned long __cdecl SM_GetButtonMask() {
     return gButtonMask.load();
 }
@@ -268,6 +305,9 @@ extern "C" __declspec(dllexport) void __cdecl SM_ReloadConfig() {
 }
 
 #ifdef _M_IX86
+#pragma comment(linker, "/EXPORT:SM_VKPressKey=_SM_VKPressKey")
+#pragma comment(linker, "/EXPORT:SM_SetVKToggleMask=_SM_SetVKToggleMask")
+#pragma comment(linker, "/EXPORT:SM_GetVKToggleMask=_SM_GetVKToggleMask")
 #pragma comment(linker, "/EXPORT:SM_GetButtonMask=_SM_GetButtonMask")
 #pragma comment(linker, "/EXPORT:SM_GetDPadMask=_SM_GetDPadMask")
 #pragma comment(linker, "/EXPORT:SM_GetStatus=_SM_GetStatus")
@@ -279,10 +319,11 @@ extern "C" __declspec(dllexport) void __cdecl SM_ReloadConfig() {
 
 class ControllerDeviceWrapper : public IDirectInputDevice8A {
 public:
-    explicit ControllerDeviceWrapper(IDirectInputDevice8A* inner)
-        : inner_(inner) {
+    explicit ControllerDeviceWrapper(IDirectInputDevice8A* inner, bool keyboard = false)
+        : inner_(inner), keyboard_(keyboard) {
         gStatus.fetch_or(1); // wrapper active
-        gStatus.fetch_or(4); // controller seen
+        if (keyboard_) gStatus.fetch_or(2);
+        else gStatus.fetch_or(4); // controller seen
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID* ppvObj) override {
@@ -387,6 +428,25 @@ public:
 
         ensure_loaded();
 
+        // Only standard DirectInput keyboard format (256 scan-code bytes) is
+        // modified. Preserve the physical keyboard: virtual keys are OR-ed.
+        if (keyboard_) {
+            if (cbData >= 256) {
+                std::lock_guard<std::mutex> lock(gMutex);
+                BYTE* keys = static_cast<BYTE*>(lpvData);
+                const DWORD now = GetTickCount();
+                for (int i = 1; i < 256; ++i) {
+                    if (gVKScanExpiry[i] && static_cast<LONG>(now - gVKScanExpiry[i]) < 0)
+                        keys[i] |= 0x80;
+                    else gVKScanExpiry[i] = 0;
+                }
+                if (gVKShiftExpiry && static_cast<LONG>(now - gVKShiftExpiry) < 0)
+                    keys[DIK_LSHIFT] |= 0x80;
+                else gVKShiftExpiry = 0;
+            }
+            return hr;
+        }
+
         unsigned char* data = static_cast<unsigned char*>(lpvData);
         unsigned long mask = 0;
 
@@ -414,6 +474,16 @@ public:
             gameWindow_ != nullptr &&
             GetForegroundWindow() == gameWindow_;
 
+        // Hardware button chord for VK visibility: works with DirectInput
+        // controllers regardless of XInput support or launcher settings.
+        const unsigned long toggleMask = gVKToggleMask.load();
+        const bool toggleDown = toggleMask && (mask & toggleMask) == toggleMask;
+        if (!toggleDown) vkToggleLatched_ = false;
+        if (foreground && toggleDown && !vkToggleLatched_ && !syncNextControllerState_) {
+            vkToggleLatched_ = true;
+            SM_SetVirtualKeyboardActive(!gVirtualKeyboardActive.load());
+        }
+
         std::lock_guard<std::mutex> lock(gMutex);
 
         // Release synthetic keys after their short pulse.
@@ -427,11 +497,20 @@ public:
         }
 
         // The virtual keyboard owns controller input while visible.
-        // Do not alter any buttons or DPAD, and do not fire shortcuts.
+        // Prevent game actions from the navigation/selection inputs.
         if (gVirtualKeyboardActive.load()) {
             for (Rule& r : gRules) {
                 if (r.syntheticDown) release_rule(r);
                 r.latched = combo_down(r, mask, dpadMask);
+            }
+            for (DWORD off : buttonOffsets_) {
+                if (off < cbData) data[off] = 0;
+            }
+            for (DWORD off : povOffsets_) {
+                if (off + sizeof(DWORD) <= cbData) {
+                    const DWORD centered = 0xFFFFFFFF;
+                    memcpy(data + off, &centered, sizeof(centered));
+                }
             }
             syncNextControllerState_ = true;
             return hr;
@@ -509,7 +588,7 @@ public:
     ) override {
         const HRESULT hr = inner_->SetDataFormat(fmt);
 
-        if (SUCCEEDED(hr) && fmt && fmt->rgodf) {
+        if (SUCCEEDED(hr) && fmt && fmt->rgodf && !keyboard_) {
             buttonOffsets_.clear();
             povOffsets_.clear();
 
@@ -663,6 +742,8 @@ public:
 private:
     std::atomic<ULONG> refs_{1};
     IDirectInputDevice8A* inner_;
+    bool keyboard_ = false;
+    bool vkToggleLatched_ = false;
     HWND gameWindow_ = nullptr;
     bool syncNextControllerState_ = true;
     std::vector<DWORD> buttonOffsets_;
@@ -719,13 +800,10 @@ public:
             const bool mouse =
                 IsEqualGUID(rguid, GUID_SysMouse) != FALSE;
 
-            if (keyboard) {
-                // IMPORTANT:
-                // The keyboard is deliberately NOT wrapped.
-                // PSO receives its native DirectInput keyboard device untouched.
-                gStatus.fetch_or(2);
-            } else if (!mouse) {
-                *out = new ControllerDeviceWrapper(*out);
+            if (!mouse) {
+                // Wrap keyboard only to OR virtual scan-code pulses onto the
+                // original game state. All physical input stays untouched.
+                *out = new ControllerDeviceWrapper(*out, keyboard);
             }
         }
 
