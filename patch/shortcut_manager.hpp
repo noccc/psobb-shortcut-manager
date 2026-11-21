@@ -8,6 +8,7 @@
 
 #include <windows.h>
 #include <dinput.h>
+#include <Xinput.h>
 
 #include <atomic>
 #include <array>
@@ -40,6 +41,51 @@ static std::atomic<unsigned long> gDpadMask(0);
 static std::atomic<unsigned long> gAxisMask(0);
 static std::atomic<int> gStatus(0);
 static std::atomic<int> gCaptureEnabled(1);
+static std::atomic<unsigned long> gXInputMask(0);
+static std::atomic<int> gXInputConnected(0);
+// XInput IDs in shortcuts.ini are 52..67; they never overlap DirectInput IDs.
+// Explicitly avoiding XInput state manipulation: polling does NOT consume the
+// game's XInput buttons. See README for this important limitation.
+using XInputGetStateFunction = DWORD (WINAPI*)(DWORD, XINPUT_STATE*);
+static XInputGetStateFunction get_xinput_state() {
+    static XInputGetStateFunction fn = []() -> XInputGetStateFunction {
+        const char* modules[] = {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"};
+        for (const char* module : modules) {
+            HMODULE h = GetModuleHandleA(module);
+            if (!h) h = LoadLibraryA(module);
+            if (h) {
+                auto f = reinterpret_cast<XInputGetStateFunction>(GetProcAddress(h, "XInputGetState"));
+                if (f) return f;
+            }
+        }
+        return nullptr;
+    }();
+    return fn;
+}
+
+static unsigned long make_xinput_mask(const XINPUT_GAMEPAD& g) {
+    unsigned long m = 0;
+    const WORD flags[] = {
+        XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_X,
+        XINPUT_GAMEPAD_Y, XINPUT_GAMEPAD_LEFT_SHOULDER,
+        XINPUT_GAMEPAD_RIGHT_SHOULDER, XINPUT_GAMEPAD_BACK,
+        XINPUT_GAMEPAD_START, XINPUT_GAMEPAD_LEFT_THUMB,
+        XINPUT_GAMEPAD_RIGHT_THUMB, 0, 0,
+        XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_RIGHT,
+        XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT
+    };
+    for (int i = 0; i < 16; ++i)
+        if (flags[i] && (g.wButtons & flags[i])) m |= (1UL << i);
+    if (g.bLeftTrigger >= XINPUT_GAMEPAD_TRIGGER_THRESHOLD + 12) m |= (1UL << 10);
+    if (g.bRightTrigger >= XINPUT_GAMEPAD_TRIGGER_THRESHOLD + 12) m |= (1UL << 11);
+    return m;
+}
+
+static bool xinput_rule(const Rule& r) {
+    for (int b : r.buttons) if (b >= 52 && b < 68) return true;
+    return false;
+}
+
 
 static std::string module_dir() {
     HMODULE hm = nullptr;
@@ -152,7 +198,7 @@ static void load_config_locked() {
 
             if (!token.empty()) {
                 const int b = atoi(token.c_str());
-                if (b >= 0 && b < 52) {
+                if (b >= 0 && b < 68) {
                     r.buttons.push_back(b);
                 }
             }
@@ -188,7 +234,7 @@ static void ensure_loaded() {
     }
 }
 
-static bool combo_down(const Rule& r, unsigned long buttonMask, unsigned long dpadMask, unsigned long axisMask) {
+static bool combo_down(const Rule& r, unsigned long buttonMask, unsigned long dpadMask, unsigned long axisMask, unsigned long xinputMask = 0) {
     if (r.buttons.empty()) return false;
 
     for (int b : r.buttons) {
@@ -199,6 +245,8 @@ static bool combo_down(const Rule& r, unsigned long buttonMask, unsigned long dp
             if ((dpadMask & (1UL << d)) == 0) return false;
         } else if (b >= 36 && b < 52) {
             if ((axisMask & (1UL << (b - 36))) == 0) return false;
+        } else if (b >= 52 && b < 68) {
+            if ((xinputMask & (1UL << (b - 52))) == 0) return false;
         } else {
             return false;
         }
@@ -235,6 +283,54 @@ extern "C" __declspec(dllexport) unsigned long __cdecl SM_GetAxisMask() {
     return gAxisMask.load();
 }
 
+extern "C" __declspec(dllexport) unsigned long __cdecl SM_GetXInputMask() {
+    return gXInputMask.load();
+}
+
+extern "C" __declspec(dllexport) int __cdecl SM_GetXInputConnected() {
+    return gXInputConnected.load();
+}
+
+// Called from the addon 'present' callback on every frame, even when its
+// configuration window is hidden. This also works when the game does not
+// create/poll a DirectInput joystick device.
+extern "C" __declspec(dllexport) void __cdecl SM_TickXInput() {
+    ensure_loaded();
+    XInputGetStateFunction fn = get_xinput_state();
+    unsigned long mask = 0;
+    int active = 0;
+    if (fn) {
+        for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
+            XINPUT_STATE st = {};
+            if (fn(i, &st) == ERROR_SUCCESS) {
+                mask = make_xinput_mask(st.Gamepad);
+                active = static_cast<int>(i) + 1;
+                break; // First connected XInput device; exposes index in UI.
+            }
+        }
+    }
+    gXInputMask.store(mask);
+    gXInputConnected.store(active);
+
+    const DWORD now = GetTickCount();
+    const HWND foreground = GetForegroundWindow();
+    DWORD pid = 0;
+    if (foreground) GetWindowThreadProcessId(foreground, &pid);
+    const bool gameForeground = pid == GetCurrentProcessId();
+    std::lock_guard<std::mutex> lock(gMutex);
+    for (Rule& r : gRules) {
+        if (!xinput_rule(r)) continue;
+        if (r.syntheticDown && static_cast<LONG>(now - r.releaseAt) >= 0)
+            release_rule(r);
+        const bool down = combo_down(r, 0, 0, 0, mask);
+        if (!down) r.latched = false;
+        if (gCaptureEnabled.load() && gameForeground && down && !r.latched) {
+            press_rule(r);
+            r.latched = true;
+        }
+    }
+}
+
 extern "C" __declspec(dllexport) int __cdecl SM_GetStatus() {
     return gStatus.load();
 }
@@ -263,6 +359,9 @@ extern "C" __declspec(dllexport) void __cdecl SM_ReloadConfig() {
 #pragma comment(linker, "/EXPORT:SM_GetDPadMask=_SM_GetDPadMask")
 #pragma comment(linker, "/EXPORT:SM_GetAxisMask=_SM_GetAxisMask")
 #pragma comment(linker, "/EXPORT:SM_GetStatus=_SM_GetStatus")
+#pragma comment(linker, "/EXPORT:SM_GetXInputMask=_SM_GetXInputMask")
+#pragma comment(linker, "/EXPORT:SM_GetXInputConnected=_SM_GetXInputConnected")
+#pragma comment(linker, "/EXPORT:SM_TickXInput=_SM_TickXInput")
 #pragma comment(linker, "/EXPORT:SM_SetCaptureEnabled=_SM_SetCaptureEnabled")
 #pragma comment(linker, "/EXPORT:SM_ReloadConfig=_SM_ReloadConfig")
 #endif
@@ -441,7 +540,8 @@ public:
         // First state after acquire/focus change = baseline only.
         if (syncNextControllerState_) {
             for (Rule& r : gRules) {
-                r.latched = combo_down(r, mask, dpadMask, axisMask);
+                if (!xinput_rule(r))
+                    r.latched = combo_down(r, mask, dpadMask, axisMask);
             }
 
             syncNextControllerState_ = false;
@@ -449,6 +549,7 @@ public:
         }
 
         for (Rule& r : gRules) {
+            if (xinput_rule(r)) continue; // Managed in SM_TickXInput.
             const bool down = combo_down(r, mask, dpadMask, axisMask);
 
             if (!down) {

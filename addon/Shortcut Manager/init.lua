@@ -6,6 +6,9 @@ unsigned long SM_GetButtonMask(void);
 unsigned long SM_GetDPadMask(void);
 unsigned long SM_GetAxisMask(void);
 int SM_GetStatus(void);
+unsigned long SM_GetXInputMask(void);
+int SM_GetXInputConnected(void);
+void SM_TickXInput(void);
 void SM_SetCaptureEnabled(int enabled);
 void SM_ReloadConfig(void);
 ]]
@@ -27,6 +30,7 @@ local captureReady = false
 local captureLastSignature = ""
 local rules = {}
 local shortcutEnabled = true
+local captureBackend = "DirectInput"
 
 local keyChoices = {
     {"1", 0x02}, {"2", 0x03}, {"3", 0x04}, {"4", 0x05}, {"5", 0x06},
@@ -69,10 +73,18 @@ local function keyName(code)
     return string.format("DIK 0x%02X", code)
 end
 
-local function maskToButtons(mask, dpadMask, axisMask)
+local function maskToButtons(mask, dpadMask, axisMask, xinputMask, backend)
     local out = {}
     local m = tonumber(mask) or 0
     local d = tonumber(dpadMask) or 0
+
+    if backend == "XInput" then
+        local x = tonumber(xinputMask) or 0
+        for i = 0, 15 do
+            if math.floor(x / 2 ^ i) % 2 == 1 then table.insert(out, 52 + i) end
+        end
+        return out
+    end
 
     for i = 0, 31 do
         local p = 2 ^ i
@@ -119,8 +131,14 @@ local function buttonLabel(t)
         [35] = "D-Pad Left",
     }
 
+    local xlabels = {
+        [52]="XInput A", [53]="XInput B", [54]="XInput X", [55]="XInput Y",
+        [56]="XInput LB", [57]="XInput RB", [58]="XInput Back", [59]="XInput Start",
+        [60]="XInput L3", [61]="XInput R3", [62]="XInput LT", [63]="XInput RT",
+        [64]="XInput Up", [65]="XInput Right", [66]="XInput Down", [67]="XInput Left"
+    }
     for _, b in ipairs(t) do
-        local name = dpadNames[b]
+        local name = dpadNames[b] or xlabels[b]
         if not name and b >= 36 and b < 52 then
             local axis = math.floor((b - 36) / 2) + 1
             local sign = (b % 2 == 0) and "-" or "+"
@@ -224,6 +242,8 @@ local function addDefaultEight()
 end
 
 local function draw()
+    -- XInput is polled every frame, independently of whether this window is visible.
+    native.SM_TickXInput()
     if not windowOpen then return end
 
     local status = native.SM_GetStatus()
@@ -262,8 +282,16 @@ local function draw()
     local mask = native.SM_GetButtonMask()
     local dpadMask = native.SM_GetDPadMask()
     local axisMask = native.SM_GetAxisMask()
+    local xinputMask = native.SM_GetXInputMask()
+    local connected = native.SM_GetXInputConnected()
 
-    imgui.Text("Inputs: " .. buttonLabel(maskToButtons(mask, dpadMask, axisMask)))
+    imgui.Text("XInput: " .. (connected > 0 and ("connected, pad " .. connected) or "not detected"))
+    if imgui.Button("Capture source: " .. captureBackend) then
+        captureBackend = captureBackend == "DirectInput" and "XInput" or "DirectInput"
+        captureMode = false
+        native.SM_SetCaptureEnabled(shortcutEnabled and 1 or 0)
+    end
+    imgui.Text("Inputs: " .. buttonLabel(maskToButtons(mask, dpadMask, axisMask, xinputMask, captureBackend)))
     imgui.Text("Axis +/- identifiers indicate analog inputs, including some triggers.")
 
     if imgui.Button("Add shortcut") then
@@ -280,14 +308,14 @@ local function draw()
 
     imgui.SameLine()
 
-    imgui.Text("Capture LT/RT and A/B/X/Y individually (controller IDs vary).")
+    imgui.Text("Select XInput for Xbox LT/RT + A/B/X/Y. DirectInput is still supported.")
 
     if captureMode then
         imgui.Text("Release all inputs, then hold LT/RT FIRST + A/B/X/Y.")
-        imgui.Text("If LT/RT appears as Axis N +/- it is an analog trigger.")
+        imgui.Text("DirectInput LT/RT may be Axis N+/-. XInput LT/RT are separate.")
 
         local now = pso.get_tick_count()
-        local held = maskToButtons(mask, dpadMask, axisMask)
+        local held = maskToButtons(mask, dpadMask, axisMask, xinputMask, captureBackend)
         local heldSet = {}
         for _, b in ipairs(held) do heldSet[b] = true end
 
@@ -357,6 +385,7 @@ local function draw()
         end
     end
 
+    imgui.Text("Note: XInput Consume cannot block the game's native XInput buttons.")
     imgui.Separator()
 
     local remove = nil
@@ -462,9 +491,9 @@ local function init()
 
     return {
         name = "Shortcut Manager",
-        version = "0.5.4",
+        version = "0.5.5",
         author = "OpenAI",
-        description = "DirectInput controller shortcuts (including Shift+F1-F12); no virtual keyboard.",
+        description = "DirectInput and XInput shortcuts (Shift+F1-F12); no virtual keyboard.",
         present = draw
     }
 end
