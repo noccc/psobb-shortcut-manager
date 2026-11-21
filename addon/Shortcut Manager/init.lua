@@ -4,14 +4,10 @@ local ffi = require("ffi")
 ffi.cdef[[
 unsigned long SM_GetButtonMask(void);
 unsigned long SM_GetDPadMask(void);
+unsigned long SM_GetAxisMask(void);
 int SM_GetStatus(void);
 void SM_SetCaptureEnabled(int enabled);
 void SM_ReloadConfig(void);
-void SM_SetVirtualKeyboardActive(int active);
-int SM_GetVirtualKeyboardActive(void);
-void SM_VKPressKey(int scan, int shift);
-void SM_SetVKToggleMask(unsigned long mask);
-unsigned long SM_GetVKToggleMask(void);
 ]]
 
 local native = ffi.load("dinput8")
@@ -31,12 +27,6 @@ local captureReady = false
 local captureLastSignature = ""
 local rules = {}
 local shortcutEnabled = true
-local vkShift = false
-local vkRow, vkColumn = 1, 1
-local vkPreviousButtons, vkPreviousDPad = 0, 0
-local captureVKToggle = false
-local vkToggleMask = bit.bor(bit.lshift(1, 6), bit.lshift(1, 7))
-local vkOptionsPath = "addons/Shortcut Manager/virtual_keyboard.ini"
 
 local keyChoices = {
     {"1", 0x02}, {"2", 0x03}, {"3", 0x04}, {"4", 0x05}, {"5", 0x06},
@@ -79,7 +69,7 @@ local function keyName(code)
     return string.format("DIK 0x%02X", code)
 end
 
-local function maskToButtons(mask, dpadMask)
+local function maskToButtons(mask, dpadMask, axisMask)
     local out = {}
     local m = tonumber(mask) or 0
     local d = tonumber(dpadMask) or 0
@@ -100,6 +90,13 @@ local function maskToButtons(mask, dpadMask)
         end
     end
 
+    local a = tonumber(axisMask) or 0
+    for i = 0, 15 do
+        local p = 2 ^ i
+        if math.floor(a / p) % 2 == 1 then
+            table.insert(out, 36 + i)
+        end
+    end
     return out
 end
 
@@ -123,7 +120,13 @@ local function buttonLabel(t)
     }
 
     for _, b in ipairs(t) do
-        table.insert(s, dpadNames[b] or ("Button " .. tostring(b + 1)))
+        local name = dpadNames[b]
+        if not name and b >= 36 and b < 52 then
+            local axis = math.floor((b - 36) / 2) + 1
+            local sign = (b % 2 == 0) and "-" or "+"
+            name = "Axis " .. tostring(axis) .. sign
+        end
+        table.insert(s, name or ("Button " .. tostring(b + 1)))
     end
 
     return table.concat(s, " + ")
@@ -215,128 +218,12 @@ local function saveRules()
 end
 
 local function addDefaultEight()
-    rules = {
-        {buttons={0,1}, key=0x02, ctrl=false, shift=false, alt=false, consume=false},
-        {buttons={0,2}, key=0x03, ctrl=false, shift=false, alt=false, consume=false},
-        {buttons={0,3}, key=0x04, ctrl=false, shift=false, alt=false, consume=false},
-        {buttons={0,4}, key=0x05, ctrl=false, shift=false, alt=false, consume=false},
-        {buttons={1,1}, key=0x06, ctrl=false, shift=false, alt=false, consume=false},
-        {buttons={1,2}, key=0x07, ctrl=false, shift=false, alt=false, consume=false},
-        {buttons={1,3}, key=0x08, ctrl=false, shift=false, alt=false, consume=false},
-        {buttons={1,4}, key=0x09, ctrl=false, shift=false, alt=false, consume=false},
-    }
-
-    saveRules()
-end
-
--- Virtual keyboard is implemented by this addon. No XInput and no d3d9 proxy.
--- DIK scan codes are merged into the standard 256-byte DirectInput keyboard
--- state inside the native dinput8 wrapper. The controller's raw mask is read
--- before navigation inputs are suppressed from the game's controller state.
-local vkRows = {
-    {{"F1",0x3B},{"F2",0x3C},{"F3",0x3D},{"F4",0x3E},{"F5",0x3F},{"F6",0x40}},
-    {{"F7",0x41},{"F8",0x42},{"F9",0x43},{"F10",0x44},{"F11",0x57},{"F12",0x58}},
-    {{"1",0x02},{"2",0x03},{"3",0x04},{"4",0x05},{"5",0x06},{"6",0x07},{"7",0x08},{"8",0x09},{"9",0x0A},{"0",0x0B}},
-    {{"Q",0x10},{"W",0x11},{"E",0x12},{"R",0x13},{"T",0x14},{"Y",0x15},{"U",0x16},{"I",0x17},{"O",0x18},{"P",0x19}},
-    {{"A",0x1E},{"S",0x1F},{"D",0x20},{"F",0x21},{"G",0x22},{"H",0x23},{"J",0x24},{"K",0x25},{"L",0x26}},
-    {{"Z",0x2C},{"X",0x2D},{"C",0x2E},{"V",0x2F},{"B",0x30},{"N",0x31},{"M",0x32},{".",0x34},{"/",0x35}},
-    {{"Space",0x39},{"Enter",0x1C},{"Backspace",0x0E},{"Tab",0x0F},{"Esc",0x01}},
-    {{"Up",0xC8},{"Left",0xCB},{"Down",0xD0},{"Right",0xCD},{"Shift",-1},{"Close",-2}},
-}
-
-local function vkLoadSettings()
-    local f = io.open(vkOptionsPath, "r")
-    if f then
-        for line in f:lines() do
-            local mask = line:match("^ToggleMask=(%d+)")
-            if mask then vkToggleMask = tonumber(mask) or vkToggleMask end
-        end
-        f:close()
-    end
-    native.SM_SetVKToggleMask(vkToggleMask)
-end
-
-local function vkSaveSettings()
-    local f = io.open(vkOptionsPath, "w")
-    if f then
-        f:write("[VirtualKeyboard]\nToggleMask=" .. tostring(vkToggleMask) .. "\n")
-        f:close()
-    end
-    native.SM_SetVKToggleMask(vkToggleMask)
-end
-
-local function vkPressed(mask, index)
-    return bit.band(mask, bit.lshift(1, index)) ~= 0
-end
-
-local function vkPress(code)
-    if code == -1 then
-        vkShift = not vkShift
-    elseif code == -2 then
-        native.SM_SetVirtualKeyboardActive(0)
-    vkLoadSettings()
-    elseif code and code > 0 then
-        native.SM_VKPressKey(code, vkShift and 1 or 0)
-    end
-end
-
-local function vkChoose()
-    local row = vkRows[vkRow]
-    if row and row[vkColumn] then vkPress(row[vkColumn][2]) end
-end
-
-local function drawVirtualKeyboard()
-    local mask = tonumber(native.SM_GetButtonMask()) or 0
-    local dpad = tonumber(native.SM_GetDPadMask()) or 0
-    local active = native.SM_GetVirtualKeyboardActive() ~= 0
-    local justButtons = bit.band(mask, bit.bnot(vkPreviousButtons))
-    local justDpad = bit.band(dpad, bit.bnot(vkPreviousDPad))
-    vkPreviousButtons, vkPreviousDPad = mask, dpad
-
-    -- Captures two physical controller buttons as the keyboard toggle.
-    if captureVKToggle then
-        local count = 0
-        for i = 0, 31 do if vkPressed(mask, i) then count = count + 1 end end
-        if count == 2 then
-            vkToggleMask = mask
-            vkSaveSettings()
-            captureVKToggle = false
-        end
-    end
-
-    if not active then return end
-
-    if bit.band(justDpad, 1) ~= 0 then vkRow = math.max(1, vkRow - 1) end
-    if bit.band(justDpad, 4) ~= 0 then vkRow = math.min(#vkRows, vkRow + 1) end
-    vkColumn = math.min(vkColumn, #vkRows[vkRow])
-    if bit.band(justDpad, 8) ~= 0 then vkColumn = math.max(1, vkColumn - 1) end
-    if bit.band(justDpad, 2) ~= 0 then vkColumn = math.min(#vkRows[vkRow], vkColumn + 1) end
-
-    if vkPressed(justButtons, 0) then vkChoose() end
-    if vkPressed(justButtons, 1) then vkPress(0x0E) end
-    if vkPressed(justButtons, 2) then vkPress(-1) end
-    if vkPressed(justButtons, 3) then vkPress(-2) end
-
-    imgui.Begin("Shortcut Manager - Virtual Keyboard")
-    imgui.Text("DirectInput keyboard - XInput not required")
-    imgui.Text("D-Pad: navigate | Button 1: type | Button 2: delete | Button 3: shift | Button 4: close")
-    imgui.Text("Shift: " .. (vkShift and "ON" or "OFF"))
-    for ri, row in ipairs(vkRows) do
-        for ci, entry in ipairs(row) do
-            if ci > 1 then imgui.SameLine() end
-            local selected = (ri == vkRow and ci == vkColumn)
-            local label = (selected and "> " or "") .. entry[1]
-            if imgui.Button(label .. "##vk_" .. ri .. "_" .. ci) then
-                vkRow, vkColumn = ri, ci
-                vkPress(entry[2])
-            end
-        end
-    end
-    imgui.End()
+    -- Controller button indices are device-specific. Fake presets silently
+    -- map face buttons as triggers and result in broken shortcuts.
+    -- Keep existing bindings; prompt the user to capture each chord instead.
 end
 
 local function draw()
-    drawVirtualKeyboard()
     if not windowOpen then return end
 
     local status = native.SM_GetStatus()
@@ -358,16 +245,6 @@ local function draw()
         ((bit.band(status, 4) ~= 0) and "YES" or "NO")
     )
 
-    imgui.Text("Integrated DirectInput Virtual Keyboard: " .. (native.SM_GetVirtualKeyboardActive() ~= 0 and "OPEN" or "CLOSED"))
-    if imgui.Button(native.SM_GetVirtualKeyboardActive() ~= 0 and "Close virtual keyboard" or "Open virtual keyboard") then
-        native.SM_SetVirtualKeyboardActive(native.SM_GetVirtualKeyboardActive() == 0 and 1 or 0)
-    end
-    if imgui.Button("Capture VK toggle (hold two controller buttons)") then
-        captureVKToggle = true
-    end
-    if captureVKToggle then imgui.Text("Hold exactly two controller buttons together...") end
-    imgui.Text("VK toggle bitmask: " .. tostring(vkToggleMask))
-
     imgui.Text(
         "Shortcuts: " ..
         (shortcutEnabled and "ON" or "OFF")
@@ -384,8 +261,10 @@ local function draw()
 
     local mask = native.SM_GetButtonMask()
     local dpadMask = native.SM_GetDPadMask()
+    local axisMask = native.SM_GetAxisMask()
 
-    imgui.Text("Inputs: " .. buttonLabel(maskToButtons(mask, dpadMask)))
+    imgui.Text("Inputs: " .. buttonLabel(maskToButtons(mask, dpadMask, axisMask)))
+    imgui.Text("Axis +/- identifiers indicate analog inputs, including some triggers.")
 
     if imgui.Button("Add shortcut") then
         captureMode = true
@@ -401,15 +280,14 @@ local function draw()
 
     imgui.SameLine()
 
-    if imgui.Button("Preset L/R + A/B/X/Y") then
-        addDefaultEight()
-    end
+    imgui.Text("Capture LT/RT and A/B/X/Y individually (controller IDs vary).")
 
     if captureMode then
-        imgui.Text("Release all buttons, then hold the trigger FIRST + A/B/X/Y.")
+        imgui.Text("Release all inputs, then hold LT/RT FIRST + A/B/X/Y.")
+        imgui.Text("If LT/RT appears as Axis N +/- it is an analog trigger.")
 
         local now = pso.get_tick_count()
-        local held = maskToButtons(mask, dpadMask)
+        local held = maskToButtons(mask, dpadMask, axisMask)
         local heldSet = {}
         for _, b in ipairs(held) do heldSet[b] = true end
 
@@ -463,7 +341,7 @@ local function draw()
                         ctrl = false,
                         shift = false,
                         alt = false,
-                        consume = false,
+                        consume = true,
                     })
                     captureMode = false
                     native.SM_SetCaptureEnabled(shortcutEnabled and 1 or 0)
@@ -581,14 +459,12 @@ local function init()
     end)
 
     loadRules()
-    native.SM_SetVirtualKeyboardActive(0)
-    vkLoadSettings()
 
     return {
         name = "Shortcut Manager",
-        version = "0.5.1",
+        version = "0.5.4",
         author = "OpenAI",
-        description = "Native DirectInput virtual keyboard and shortcut manager, XInput optional.",
+        description = "DirectInput controller shortcuts (including Shift+F1-F12); no virtual keyboard.",
         present = draw
     }
 end
